@@ -3517,6 +3517,95 @@ class TestGQASplitDecode(unittest.TestCase):
         self.assertEqual(failures, [])
 
 
+def gqa_split_decode_quantized_test_cases():
+    """Split decode shapes (a subset of gqa_split_decode_test_cases: one split and many, packed and separate
+    QKV, QK-Norm, a context ending inside an 8-key step) on an 8-bit cache: INT8 and, when built, FP8 E4M3,
+    each with PER_TENSOR and PER_CHANNEL scales."""
+    picked = {
+        "b1_past1_buf10",
+        "b2_past63_buf72",
+        "b3_past255_buf264",
+        "b1_past4095_buf4096",
+        "b3_past31_buf40",
+        "b1_past1000_buf1009",
+        "b4_past6000_buf6009",
+        "b40_past700_buf709",
+    }
+    kv_types = ["int8"] + (["fp8"] if has_fp8_kv_cache else [])
+    for name, config in gqa_split_decode_test_cases():
+        if "_".join(name.split("_")[:3]) not in picked or config.has_position_ids:
+            continue
+        for kv_type in kv_types:
+            for quant_mode in ["PER_TENSOR", "PER_CHANNEL"]:
+                q_config = deepcopy(config)
+                q_config.k_quant_type = quant_mode
+                q_config.v_quant_type = quant_mode
+                q_config.kv_cache_type = kv_type
+                q_config.kv_cache_bit_width = 8
+                yield f"{name}_{kv_type}_{quant_mode}", q_config
+
+
+@unittest.skipIf(not has_flash_attention(), "Flash Attention is not available, skipping tests.")
+@unittest.skipIf(not has_quantized_kv_cache(), "Quantized KV Cache is not available, skipping tests.")
+class TestGQASplitDecodeQuantizedKV(unittest.TestCase):
+    """ORT_GQA_SPLIT_DECODE=1 on an INT8 / FP8 cache: the split decode kernel appends the quantized token and
+    reads the 8-bit cache as stored, in place of dequantizing the whole cache for Flash attention."""
+
+    @staticmethod
+    def _run(config, split_decode):
+        """parity_check_gqa_past with the split decode switch set; returns the debug info and ORT's outputs."""
+        outputs = []
+        original = gqa_past_func  # the module function, before the patch below replaces the global
+
+        def record(*args, **kwargs):
+            result = original(*args, **kwargs)
+            outputs.append(result)
+            return result
+
+        def run():
+            parity_check_gqa_past(
+                config=deepcopy(config),
+                ep="CUDAExecutionProvider",
+                device="cuda",
+                torch_type=torch.float16,
+                ort_type=TensorProto.FLOAT16,
+                causal=True,
+                rtol=rtol[f"{config.kv_cache_type}_fp16"],
+                atol=atol[f"{config.kv_cache_type}_fp16"],
+            )
+
+        with mock.patch(f"{__name__}.gqa_past_func", side_effect=record):
+            with scoped_env_var("ORT_GQA_SPLIT_DECODE", "1" if split_decode else "0"):
+                info = get_attention_kernel_debug_info(run)
+        return info, outputs[-1]
+
+    @staticmethod
+    def _as_float(t):
+        return (t if isinstance(t, torch.Tensor) else torch.from_numpy(numpy.asarray(t))).float().cpu()
+
+    @parameterized.expand(gqa_split_decode_quantized_test_cases())
+    def test_gqa_split_decode_quantized(self, name, config):
+        # Against the reference attention over the dequantized cache (and the appended token checked in the
+        # returned cache), within the quantized-cache tolerances.
+        info, (out, present_k, present_v) = self._run(config, split_decode=True)
+        self.assertIn(" SplitDecode=1", info)
+        # Against the dequantize-then-Flash fallback on the same inputs: the same quantized cache, and an output
+        # that differs only by fp16 rounding (the fallback rounds each dequantized element to fp16; split decode
+        # folds a PER_TENSOR K scale into the scores and the V scales into the output).
+        info, (out_ref, present_k_ref, present_v_ref) = self._run(config, split_decode=False)
+        self.assertNotIn("SplitDecode=1", info)
+        to_int = (lambda t: self._as_float(t)) if config.kv_cache_type == "int8" else None
+        if to_int is not None:
+            self.assertTrue(torch.equal(to_int(present_k), to_int(present_k_ref)))
+            self.assertTrue(torch.equal(to_int(present_v), to_int(present_v_ref)))
+        else:
+            for a, b in ((present_k, present_k_ref), (present_v, present_v_ref)):
+                a = a if isinstance(a, torch.Tensor) else torch.from_numpy(numpy.asarray(a))
+                b = b if isinstance(b, torch.Tensor) else torch.from_numpy(numpy.asarray(b))
+                self.assertTrue(torch.equal(a.view(torch.uint8).cpu(), b.view(torch.uint8).cpu()))
+        torch.testing.assert_close(self._as_float(out), self._as_float(out_ref), rtol=1e-2, atol=1e-2)
+
+
 @unittest.skipIf(not has_flash_attention(), "Flash Attention is not available, skipping tests.")
 @unittest.skipIf(not has_quantized_kv_cache(), "Quantized KV Cache is not available, skipping tests.")
 class TestFlashGQABF16QuantizedKV(unittest.TestCase):

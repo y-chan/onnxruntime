@@ -3,6 +3,8 @@
 
 #include "contrib_ops/cuda/bert/group_query_attention_split_decode.h"
 
+#include <cuda_fp8.h>
+
 #include <algorithm>
 #include <cfloat>
 #include <cstdint>
@@ -25,15 +27,42 @@ constexpr int kRecord = kHead + 2;  // per split and head: partial output, max, 
 
 static_assert(kHead == 128 && kGroup == 8, "fragment layout below assumes 8 heads of 128 channels");
 
+// Cache element kinds as template arguments (GqaSplitDecodeCache on the host).
+constexpr int kCacheFp16 = 0;
+constexpr int kCacheInt8 = 1;
+constexpr int kCacheFp8 = 2;
+
+// Bytes of one cached key or value row (kHead elements).
+template <int kCache>
+constexpr int RowBytes() { return kCache == kCacheFp16 ? 2 * kHead : kHead; }
+
+// The widened E4M3 values are 2^-8 of the real ones (see Widen8); the scales carry the factor back.
+template <int kCache>
+constexpr float WidenedScale() { return kCache == kCacheFp8 ? 256.0f : 1.0f; }
+
+// One fp16 value quantized for an 8-bit cache, as UnpackRoPEAppend does.
+template <int kCache>
+__device__ __forceinline__ uint32_t Quantize8(float x, float sc) {
+  const float v = x * (sc == 0.0f ? 0.0f : 1.0f / sc);
+  if constexpr (kCache == kCacheInt8) {
+    return static_cast<uint8_t>(static_cast<int8_t>(fmaxf(-128.0f, fminf(127.0f, rintf(v)))));
+  } else {
+    const __nv_fp8_e4m3 f(fminf(448.0f, fmaxf(-448.0f, v)));
+    return *reinterpret_cast<const uint8_t*>(&f);
+  }
+}
+
 // grid (num_heads + 2 * kv_num_heads, batch), block 32. Lane l owns channels 4l..4l+3; with the
 // half-split rotation the partner of channel c is c +- head_size / 2, i.e. lane l ^ 16.
+template <int kCache>
 __global__ void __launch_bounds__(32) GqaSplitDecodePrepKernel(
     const half* __restrict__ packed_qkv, const half* __restrict__ q_in, const half* __restrict__ k_in,
-    const half* __restrict__ v_in, half* __restrict__ q_out, half* __restrict__ k_cache, half* __restrict__ v_cache,
+    const half* __restrict__ v_in, half* __restrict__ q_out, void* __restrict__ k_cache, void* __restrict__ v_cache,
     const int* __restrict__ past_seq_lens, const int64_t* __restrict__ position_ids,
     const half* __restrict__ cos_cache, const half* __restrict__ sin_cache, int rope_max_pos, int do_rotary,
     const half* __restrict__ q_norm, const half* __restrict__ k_norm, float q_eps, float k_eps,
-    unsigned int* __restrict__ counters, int num_heads, int kv_num_heads, int capacity) {
+    unsigned int* __restrict__ counters, int num_heads, int kv_num_heads, int capacity,
+    const float* __restrict__ k_scale, const float* __restrict__ v_scale, int k_per_channel, int v_per_channel) {
   static_assert(kHead == 128, "lane l owns channels 4l..4l+3");
   const int head = blockIdx.x, b = blockIdx.y, lane = threadIdx.x;
   const int packed_width = (num_heads + 2 * kv_num_heads) * kHead;
@@ -93,14 +122,28 @@ __global__ void __launch_bounds__(32) GqaSplitDecodePrepKernel(
       }
     }
   }
-  uint2 out;
-  memcpy(&out, x, sizeof(out));
   if (type == 0) {
+    uint2 out;
+    memcpy(&out, x, sizeof(out));
     reinterpret_cast<uint2*>(q_out + (static_cast<int64_t>(b) * num_heads + n) * kHead)[lane] = out;
   } else if (past >= 0 && past < capacity) {
-    half* cache = type == 1 ? k_cache : v_cache;
     const int64_t row = (static_cast<int64_t>(b) * kv_num_heads + n) * capacity + past;
-    reinterpret_cast<uint2*>(cache + row * kHead)[lane] = out;
+    void* cache = type == 1 ? k_cache : v_cache;
+    if constexpr (kCache == kCacheFp16) {
+      uint2 out;
+      memcpy(&out, x, sizeof(out));
+      reinterpret_cast<uint2*>(static_cast<half*>(cache) + row * kHead)[lane] = out;
+    } else {
+      const float* scale = type == 1 ? k_scale : v_scale;
+      const bool per_channel = (type == 1 ? k_per_channel : v_per_channel) != 0;
+      uint32_t packed = 0;
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const float sc = per_channel ? scale[n * kHead + lane * 4 + i] : scale[0];
+        packed |= Quantize8<kCache>(__half2float(x[i]), sc) << (8 * i);
+      }
+      reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(cache) + row * kHead)[lane] = packed;
+    }
   }
   // The attention kernel that follows on the same stream counts finished splits per (batch, kv head).
   if (type == 1 && lane == 0) counters[b * kv_num_heads + n] = 0;
@@ -161,9 +204,58 @@ __device__ __forceinline__ uint32_t PackHalf2(float lo, float hi) {
   return *reinterpret_cast<const uint32_t*>(&h);
 }
 
+// Eight 8-bit cache values (element 0 in the low byte) widened to eight halves, in the layout of eight
+// fp16 cache elements. Exact: INT8 b becomes the half 0x64XX = 1024 + XX with XX = b ^ 0x80 = b + 128
+// (mod 256), minus 1152; E4M3 s.eeee.mmm becomes the half s.0eeee.mmm0000000, which is 2^-8 of the
+// E4M3 value for normal and subnormal inputs alike (no NaN is ever stored: the quantizer saturates).
+template <int kCache>
+__device__ __forceinline__ uint4 Widen8(uint2 u) {
+  uint32_t w[4];
+  if constexpr (kCache == kCacheInt8) {
+    const half2 bias = __float2half2_rn(1152.0f);
+    const uint32_t x0 = u.x ^ 0x80808080u, x1 = u.y ^ 0x80808080u;
+    const uint32_t m[4] = {__byte_perm(x0, 0x64646464u, 0x4140), __byte_perm(x0, 0x64646464u, 0x4342),
+                           __byte_perm(x1, 0x64646464u, 0x4140), __byte_perm(x1, 0x64646464u, 0x4342)};
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const half2 h = __hsub2(*reinterpret_cast<const half2*>(&m[i]), bias);
+      w[i] = *reinterpret_cast<const uint32_t*>(&h);
+    }
+  } else {
+    // Byte b of a pair goes to bits 8..15 of its half, then the magnitude moves down one bit.
+    const uint32_t m[4] = {__byte_perm(u.x, 0u, 0x1404), __byte_perm(u.x, 0u, 0x3424),
+                           __byte_perm(u.y, 0u, 0x1404), __byte_perm(u.y, 0u, 0x3424)};
+#pragma unroll
+    for (int i = 0; i < 4; ++i) w[i] = ((m[i] >> 1) & 0x3F803F80u) | (m[i] & 0x80008000u);
+  }
+  return make_uint4(w[0], w[1], w[2], w[3]);
+}
+
+// Eight widened K channels times their PER_CHANNEL scales, in fp32, rounded to fp16.
+__device__ __forceinline__ uint4 ScaleChannels(uint4 k, const float* sc) {
+  uint32_t w[4] = {k.x, k.y, k.z, k.w};
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const float2 f = __half22float2(*reinterpret_cast<const half2*>(&w[i]));
+    w[i] = PackHalf2(f.x * sc[2 * i], f.y * sc[2 * i + 1]);
+  }
+  return make_uint4(w[0], w[1], w[2], w[3]);
+}
+
 // Output channel held in o[j][e] by a lane with r = lane % 4 (see the P * V layout below).
 __device__ __forceinline__ int OutChannel(int j, int r, int e) {
   return (j < 8 ? 0 : 64) + 8 * (2 * r + e) + (j & 7);
+}
+
+// XOR swizzle of a row's 16-byte chunks in the shared-memory ring, chosen so the fragment reads below are free
+// of bank conflicts beyond the minimum wavefronts. fp16 rows have 16 chunks, 8-bit rows 8.
+template <int kCache>
+__device__ __forceinline__ int KSwizzle(int row) {
+  return kCache == kCacheFp16 ? (row & 1) << 2 : (row & 3) << 1;
+}
+template <int kCache>
+__device__ __forceinline__ int VSwizzle(int row) {
+  return kCache == kCacheFp16 ? ((row >> 1) & 3) << 1 : ((row >> 1) & 1) << 2;
 }
 
 // grid (kv_num_heads, max_splits, batch), block kThreads. The grid is fixed per capture; the CTAs
@@ -176,22 +268,29 @@ __device__ __forceinline__ int OutChannel(int j, int r, int e) {
 //    the step as two k16 slices.
 //  * P * V: the score accumulators of lane (g, r) are P[g][2r..2r+1], which is the m16n8k8 A fragment.
 //    The B fragment needs V[2r..2r+1][n] for output tile j; with n -> channel (j < 8 ? 0 : 64) + 8 * g +
-//    (j & 7) lane (g, r) gets all of it from two 16-byte words per key row, so outputs come out permuted
+//    (j & 7) lane (g, r) gets all of it from two 8-element pieces per key row, so outputs come out permuted
 //    (OutChannel).
 // K and V reach the fragments through a per-warp ring of kStages steps in shared memory filled with
-// cp.async, kStages - 1 steps ahead. The copy moves whole 256-byte key rows, 16 lanes per row: loading the
-// fragments straight from global memory touches only 64 bytes of each 128-byte line of K per request, which
-// caps the streaming rate of an SM well below its share of DRAM bandwidth.
-template <int kStages>
+// cp.async, kStages - 1 steps ahead. The copy moves whole key rows, 16 bytes per lane: loading the
+// fragments straight from global memory touches only part of each 128-byte line of K per request, which
+// caps the streaming rate of an SM well below its share of DRAM bandwidth. An 8-bit cache is copied as is and
+// widened to fp16 as the fragments are read (Widen8).
+template <int kStages, int kCache>
 __global__ void __launch_bounds__(kThreads, 1) GqaSplitDecodeKernel(const half* __restrict__ q,
-                                                                    const half* __restrict__ k_cache,
-                                                                    const half* __restrict__ v_cache,
+                                                                    const void* __restrict__ k_cache,
+                                                                    const void* __restrict__ v_cache,
                                                                     half* __restrict__ out,
                                                                     const int* __restrict__ total_seq_lens,
                                                                     float scale, int capacity,
                                                                     float* __restrict__ partials,
-                                                                    unsigned int* __restrict__ counters) {
+                                                                    unsigned int* __restrict__ counters,
+                                                                    const float* __restrict__ k_scale,
+                                                                    const float* __restrict__ v_scale,
+                                                                    int k_per_channel, int v_per_channel) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+  constexpr int kRow = RowBytes<kCache>();
+  constexpr int kChunks = kRow / 16;  // 16-byte chunks per row
+  constexpr bool kQuantized = kCache != kCacheFp16;
   // The ring is [warp][stage][K, V][key row][16-byte chunk]; after the main loop the same memory holds the
   // per-warp outputs (s_red). The 128-byte alignment matters: at the
   // default offset after the static shared variables every cp.async row straddles two 128-byte lines, which
@@ -213,30 +312,53 @@ __global__ void __launch_bounds__(kThreads, 1) GqaSplitDecodeKernel(const half* 
   const int chunk = (steps + splits - 1) / splits * kStep;
   const int t0 = split * chunk, t1 = min(total, t0 + chunk);
 
+  // Dequantization. PER_TENSOR K goes into the score scale; PER_CHANNEL K scales this lane's 32 channels
+  // (32 * blk + 8 * r + i) of each widened key; V scales are applied to the output channels at the end.
+  constexpr float kWidened = WidenedScale<kCache>();
+  float qk_scale = scale;
+  float ksc[32];
+  if constexpr (kQuantized) {
+    if (k_per_channel) {
+#pragma unroll
+      for (int blk = 0; blk < 4; ++blk) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) ksc[8 * blk + i] = __ldg(k_scale + kvh * kHead + 32 * blk + 8 * r + i) * kWidened;
+      }
+    } else {
+      qk_scale *= __ldg(k_scale) * kWidened;
+    }
+  }
+  auto v_out_scale = [&](int channel) -> float {
+    if constexpr (kQuantized) {
+      return (v_per_channel ? __ldg(v_scale + kvh * kHead + channel) : __ldg(v_scale)) * kWidened;
+    } else {
+      return 1.0f;
+    }
+  };
+
   const int bh = b * kv_heads + kvh;
   const half* qrow = q + (static_cast<int64_t>(bh) * kGroup + g) * kHead;
   uint4 qf[4];
 #pragma unroll
   for (int blk = 0; blk < 4; ++blk) qf[blk] = __ldg(reinterpret_cast<const uint4*>(qrow + 32 * blk + 8 * r));
-  const int64_t cache_off = static_cast<int64_t>(bh) * capacity * kHead;
-  const half* kb = k_cache + cache_off;
-  const half* vb = v_cache + cache_off;
-  uint4* ring = s_ring + warp * kStages * 2 * kStep * 16;
+  const int64_t cache_off = static_cast<int64_t>(bh) * capacity * kRow;  // bytes
+  const char* kb = static_cast<const char*>(k_cache) + cache_off;
+  const char* vb = static_cast<const char*>(v_cache) + cache_off;
+  uint4* ring = s_ring + warp * kStages * 2 * kStep * kChunks;
 
-  // Copies the 8 key rows of K and of V from `base` into ring stage `stage`. Chunks are XOR-swizzled within
-  // their 128-byte line so the fragment reads below are free of bank conflicts: K by (row & 1) << 2, V by
-  // ((row >> 1) & 3) << 1. Rows past the context are zero-filled: uninitialized cache memory could hold NaN,
-  // and 0 * NaN = NaN.
+  // Copies the 8 key rows of K and of V from `base` into ring stage `stage`, chunks XOR-swizzled within
+  // their row (KSwizzle / VSwizzle). Rows past the context are zero-filled: uninitialized cache memory could
+  // hold NaN, and 0 * NaN = NaN.
   auto issue = [&](int base, int stage) {
-    uint4* dk = ring + stage * 2 * kStep * 16;
-    uint4* dv = dk + kStep * 16;
+    uint4* dk = ring + stage * 2 * kStep * kChunks;
+    uint4* dv = dk + kStep * kChunks;
 #pragma unroll
-    for (int j = 0; j < kStep * 16 / 32; ++j) {
-      const int c = lane + 32 * j, row = c >> 4, col = c & 15;
+    for (int j = 0; j < kStep * kChunks / 32; ++j) {
+      const int c = lane + 32 * j, row = c / kChunks, col = c % kChunks;
       const bool ok = base + row < t1;
-      const int64_t src = static_cast<int64_t>(ok ? base + row : t0) * kHead + 8 * col;
-      CpAsync16(dk + row * 16 + (col ^ ((row & 1) << 2)), kb + src, ok);
-      CpAsync16(dv + row * 16 + (col ^ (((row >> 1) & 3) << 1)), vb + src, ok);
+      const int64_t src = static_cast<int64_t>(ok ? base + row : t0) * kRow + 16 * col;
+      CpAsync16(dk + row * kChunks + (col ^ KSwizzle<kCache>(row)), kb + src, ok);
+      CpAsync16(dv + row * kChunks + (col ^ VSwizzle<kCache>(row)), vb + src, ok);
     }
   };
 
@@ -262,16 +384,39 @@ __global__ void __launch_bounds__(kThreads, 1) GqaSplitDecodeKernel(const half* 
     CpAsyncCommit();
     CpAsyncWait<kStages - 1>();
     __syncwarp();  // the step was copied by other lanes of the warp
-    // kr[blk] = K[g][32 * blk + 8r ..]; vr[2e + i] = V[2r + e][(i ? 64 : 0) + 8g ..].
+    // kr[blk] = K[g][32 * blk + 8r ..]; vr[2e + i] = V[2r + e][(i ? 64 : 0) + 8g ..], 8 halves each.
     uint4 kr[4], vr[4];
-    const uint4* sk = ring + stage * 2 * kStep * 16;
-    const uint4* sv = sk + kStep * 16;
+    const uint4* sk = ring + stage * 2 * kStep * kChunks;
+    const uint4* sv = sk + kStep * kChunks;
+    if constexpr (!kQuantized) {
 #pragma unroll
-    for (int blk = 0; blk < 4; ++blk) kr[blk] = sk[g * 16 + ((4 * blk + r) ^ ((g & 1) << 2))];
+      for (int blk = 0; blk < 4; ++blk) kr[blk] = sk[g * kChunks + ((4 * blk + r) ^ KSwizzle<kCache>(g))];
 #pragma unroll
-    for (int e = 0; e < 2; ++e) {
+      for (int e = 0; e < 2; ++e) {
 #pragma unroll
-      for (int i = 0; i < 2; ++i) vr[2 * e + i] = sv[(2 * r + e) * 16 + ((8 * i + g) ^ (r << 1))];
+        for (int i = 0; i < 2; ++i) {
+          vr[2 * e + i] = sv[(2 * r + e) * kChunks + ((8 * i + g) ^ VSwizzle<kCache>(2 * r + e))];
+        }
+      }
+    } else {
+      // 8 bytes per piece: K channels 32 * blk + 8r are bytes 8 * (4 * blk + r) of row g, V channels
+      // 64i + 8g bytes 8 * (8 * i + g) of row 2r + e.
+#pragma unroll
+      for (int blk = 0; blk < 4; ++blk) {
+        const int c = 2 * blk + (r >> 1);
+        kr[blk] = Widen8<kCache>(
+            reinterpret_cast<const uint2*>(sk + g * kChunks + (c ^ KSwizzle<kCache>(g)))[r & 1]);
+        if (k_per_channel) kr[blk] = ScaleChannels(kr[blk], ksc + 8 * blk);
+      }
+#pragma unroll
+      for (int e = 0; e < 2; ++e) {
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+          const int row = 2 * r + e, c = 4 * i + (g >> 1);
+          vr[2 * e + i] = Widen8<kCache>(
+              reinterpret_cast<const uint2*>(sv + row * kChunks + (c ^ VSwizzle<kCache>(row)))[g & 1]);
+        }
+      }
     }
     stage = stage == kStages - 1 ? 0 : stage + 1;
 
@@ -282,8 +427,8 @@ __global__ void __launch_bounds__(kThreads, 1) GqaSplitDecodeKernel(const half* 
       MmaK16(s0, s1, qf[blk].x, qf[blk].y, kr[blk].x, kr[blk].y);
       MmaK16(s2, s3, qf[blk].z, qf[blk].w, kr[blk].z, kr[blk].w);
     }
-    s0 = base + 2 * r < t1 ? (s0 + s2) * scale : -INFINITY;
-    s1 = base + 2 * r + 1 < t1 ? (s1 + s3) * scale : -INFINITY;
+    s0 = base + 2 * r < t1 ? (s0 + s2) * qk_scale : -INFINITY;
+    s1 = base + 2 * r + 1 < t1 ? (s1 + s3) * qk_scale : -INFINITY;
     float mx = fmaxf(s0, s1);
     mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
     mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 2));
@@ -340,7 +485,7 @@ __global__ void __launch_bounds__(kThreads, 1) GqaSplitDecodeKernel(const half* 
       float acc = 0.f;
 #pragma unroll
       for (int w = 0; w < kWarps; ++w) acc += (&s_red[w][0][0])[i];
-      ob[i] = __float2half(acc * s_inv[i / kHead]);
+      ob[i] = __float2half(acc * s_inv[i / kHead] * v_out_scale(i % kHead));
     }
     return;
   }
@@ -423,6 +568,13 @@ __global__ void __launch_bounds__(kThreads, 1) GqaSplitDecodeKernel(const half* 
         acc.w = fmaf(v[jj].w, wt, acc.w);
       }
     }
+    if constexpr (kQuantized) {
+      const int c = o4 * 4 % kHead;
+      acc.x *= v_out_scale(c);
+      acc.y *= v_out_scale(c + 1);
+      acc.z *= v_out_scale(c + 2);
+      acc.w *= v_out_scale(c + 3);
+    }
     half2* dst = reinterpret_cast<half2*>(ob + o4 * 4);
     dst[0] = __floats2half2_rn(acc.x, acc.y);
     dst[1] = __floats2half2_rn(acc.z, acc.w);
@@ -430,29 +582,64 @@ __global__ void __launch_bounds__(kThreads, 1) GqaSplitDecodeKernel(const half* 
 #endif
 }
 
-constexpr size_t RingBytes(int stages) { return sizeof(uint4) * kWarps * stages * 2 * kStep * 16; }
-
-// Ring depth for this device: 4 steps (128 KB) where the per-block opt-in shared memory allows it (sm_80,
-// sm_87, sm_90), else 3 (96 KB, within the 99 KB of sm_86, sm_89 and sm_120).
-int RingStages() {
-  int device = 0, optin = 0;
-  if (cudaGetDevice(&device) != cudaSuccess ||
-      cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device) != cudaSuccess) {
-    return 3;
-  }
-  return optin >= static_cast<int>(RingBytes(4)) + 4096 ? 4 : 3;  // + the static shared variables
+template <int kCache>
+constexpr size_t RingBytes(int stages) {
+  return sizeof(uint4) * kWarps * stages * 2 * kStep * (RowBytes<kCache>() / 16);
 }
 
-template <int kStages>
-Status Launch(cudaStream_t stream, dim3 grid, const half* q, const half* k_cache, const half* v_cache, half* output,
-              const int* total_seq_lens, float scale, int capacity, float* partials, unsigned int* counters) {
-  constexpr int kBytes = static_cast<int>(RingBytes(kStages));
+template <int kStages, int kCache>
+Status Launch(cudaStream_t stream, dim3 grid, const half* q, const void* k_cache, const void* v_cache, half* output,
+              const int* total_seq_lens, float scale, int capacity, float* partials, unsigned int* counters,
+              const GqaSplitDecodeQuant& quant) {
+  constexpr int kBytes = static_cast<int>(RingBytes<kCache>(kStages));
   static_assert(sizeof(float) * kWarps * kGroup * kHead <= kBytes, "s_red must fit in the ring");
-  ORT_RETURN_IF_ERROR(CUDA_CALL(
-      cudaFuncSetAttribute(GqaSplitDecodeKernel<kStages>, cudaFuncAttributeMaxDynamicSharedMemorySize, kBytes)));
-  GqaSplitDecodeKernel<kStages><<<grid, kThreads, kBytes, stream>>>(q, k_cache, v_cache, output, total_seq_lens,
-                                                                     scale, capacity, partials, counters);
+  ORT_RETURN_IF_ERROR(CUDA_CALL(cudaFuncSetAttribute(GqaSplitDecodeKernel<kStages, kCache>,
+                                                     cudaFuncAttributeMaxDynamicSharedMemorySize, kBytes)));
+  GqaSplitDecodeKernel<kStages, kCache><<<grid, kThreads, kBytes, stream>>>(
+      q, k_cache, v_cache, output, total_seq_lens, scale, capacity, partials, counters, quant.k_scale, quant.v_scale,
+      quant.k_per_channel ? 1 : 0, quant.v_per_channel ? 1 : 0);
   return CUDA_CALL(cudaGetLastError());
+}
+
+// Whether a ring of `stages` steps plus the kernel's static shared memory fits the per-block opt-in limit.
+template <int kStages, int kCache>
+bool RingFits() {
+  int device = 0, optin = 0;
+  cudaFuncAttributes attr{};
+  if (cudaGetDevice(&device) != cudaSuccess ||
+      cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device) != cudaSuccess ||
+      cudaFuncGetAttributes(&attr, GqaSplitDecodeKernel<kStages, kCache>) != cudaSuccess) {
+    return false;
+  }
+  return attr.sharedSizeBytes + RingBytes<kCache>(kStages) <= static_cast<size_t>(optin);
+}
+
+// Ring depth: the deepest ring that fits. fp16: 4 steps (128 KB) on sm_80 / sm_87 / sm_90, else 3 (96 KB,
+// within the 99 KB of sm_86, sm_89 and sm_120). 8-bit rows are half as long, so the same bytes in flight
+// take twice the steps: 8 (128 KB), else 6 (96 KB), else 4.
+template <int kCache>
+Status LaunchCache(cudaStream_t stream, dim3 grid, const half* q, const void* k_cache, const void* v_cache,
+                   half* output, const int* total_seq_lens, float scale, int capacity, float* partials,
+                   unsigned int* counters, const GqaSplitDecodeQuant& quant) {
+  if constexpr (kCache == kCacheFp16) {
+    if (RingFits<4, kCache>()) {
+      return Launch<4, kCache>(stream, grid, q, k_cache, v_cache, output, total_seq_lens, scale, capacity, partials,
+                               counters, quant);
+    }
+    return Launch<3, kCache>(stream, grid, q, k_cache, v_cache, output, total_seq_lens, scale, capacity, partials,
+                             counters, quant);
+  } else {
+    if (RingFits<8, kCache>()) {
+      return Launch<8, kCache>(stream, grid, q, k_cache, v_cache, output, total_seq_lens, scale, capacity, partials,
+                               counters, quant);
+    }
+    if (RingFits<6, kCache>()) {
+      return Launch<6, kCache>(stream, grid, q, k_cache, v_cache, output, total_seq_lens, scale, capacity, partials,
+                               counters, quant);
+    }
+    return Launch<4, kCache>(stream, grid, q, k_cache, v_cache, output, total_seq_lens, scale, capacity, partials,
+                             counters, quant);
+  }
 }
 
 }  // namespace
@@ -483,26 +670,49 @@ size_t GqaSplitDecodeCountersBytes(int batch_size, int kv_num_heads) {
 }
 
 Status LaunchGqaSplitDecodePrep(cudaStream_t stream, const half* packed_qkv, const half* q, const half* k,
-                                const half* v, half* q_out, half* k_cache, half* v_cache, const int* past_seq_lens,
+                                const half* v, half* q_out, void* k_cache, void* v_cache, const int* past_seq_lens,
                                 const int64_t* position_ids, const half* cos_cache, const half* sin_cache,
                                 int rope_max_pos, bool do_rotary, const half* q_norm, const half* k_norm, float q_eps,
                                 float k_eps, unsigned int* counters, int batch_size, int num_heads, int kv_num_heads,
-                                int capacity) {
-  GqaSplitDecodePrepKernel<<<dim3(num_heads + 2 * kv_num_heads, batch_size), 32, 0, stream>>>(
-      packed_qkv, q, k, v, q_out, k_cache, v_cache, past_seq_lens, position_ids, cos_cache, sin_cache, rope_max_pos,
-      do_rotary ? 1 : 0, q_norm, k_norm, q_eps, k_eps, counters, num_heads, kv_num_heads, capacity);
+                                int capacity, const GqaSplitDecodeQuant& quant) {
+  const dim3 grid(num_heads + 2 * kv_num_heads, batch_size);
+  const int kpc = quant.k_per_channel ? 1 : 0, vpc = quant.v_per_channel ? 1 : 0;
+#define ORT_GQA_SPLIT_DECODE_PREP(kCache)                                                                         \
+  GqaSplitDecodePrepKernel<kCache><<<grid, 32, 0, stream>>>(                                                      \
+      packed_qkv, q, k, v, q_out, k_cache, v_cache, past_seq_lens, position_ids, cos_cache, sin_cache, rope_max_pos, \
+      do_rotary ? 1 : 0, q_norm, k_norm, q_eps, k_eps, counters, num_heads, kv_num_heads, capacity, quant.k_scale,  \
+      quant.v_scale, kpc, vpc)
+  switch (quant.cache) {
+    case GqaSplitDecodeCache::kInt8:
+      ORT_GQA_SPLIT_DECODE_PREP(kCacheInt8);
+      break;
+    case GqaSplitDecodeCache::kFp8E4M3:
+      ORT_GQA_SPLIT_DECODE_PREP(kCacheFp8);
+      break;
+    default:
+      ORT_GQA_SPLIT_DECODE_PREP(kCacheFp16);
+      break;
+  }
+#undef ORT_GQA_SPLIT_DECODE_PREP
   return CUDA_CALL(cudaGetLastError());
 }
 
-Status LaunchGqaSplitDecode(cudaStream_t stream, const half* q, const half* k_cache, const half* v_cache, half* output,
-                            const int* total_seq_lens, float scale, int batch_size, int kv_num_heads, int capacity,
-                            int max_splits, float* partials, unsigned int* counters) {
-  const int stages = RingStages();
+Status LaunchGqaSplitDecode(cudaStream_t stream, const half* q, const void* k_cache, const void* v_cache,
+                            half* output, const int* total_seq_lens, float scale, int batch_size, int kv_num_heads,
+                            int capacity, int max_splits, float* partials, unsigned int* counters,
+                            const GqaSplitDecodeQuant& quant) {
   const dim3 grid(kv_num_heads, max_splits, batch_size);
-  return stages == 4 ? Launch<4>(stream, grid, q, k_cache, v_cache, output, total_seq_lens, scale, capacity, partials,
-                                 counters)
-                     : Launch<3>(stream, grid, q, k_cache, v_cache, output, total_seq_lens, scale, capacity, partials,
-                                 counters);
+  switch (quant.cache) {
+    case GqaSplitDecodeCache::kInt8:
+      return LaunchCache<kCacheInt8>(stream, grid, q, k_cache, v_cache, output, total_seq_lens, scale, capacity,
+                                     partials, counters, quant);
+    case GqaSplitDecodeCache::kFp8E4M3:
+      return LaunchCache<kCacheFp8>(stream, grid, q, k_cache, v_cache, output, total_seq_lens, scale, capacity,
+                                    partials, counters, quant);
+    default:
+      return LaunchCache<kCacheFp16>(stream, grid, q, k_cache, v_cache, output, total_seq_lens, scale, capacity,
+                                     partials, counters, quant);
+  }
 }
 
 }  // namespace cuda

@@ -143,8 +143,14 @@ GroupQueryAttention<T, U>::GroupQueryAttention(const OpKernelInfo& info)
   constexpr bool kIsFp16OrBf16 = std::is_same_v<T, MLFloat16> || std::is_same_v<T, BFloat16>;
   // XQA defaults on for fp16/bf16; ORT_ENABLE_XQA=0 disables it explicitly.
   enable_xqa_ = kIsFp16OrBf16 && (ParseEnvironmentVariableWithDefault<int>("ORT_ENABLE_XQA", 1) != 0);
-  // ORT_GQA_SPLIT_DECODE=1 opts in to the single-token split decode kernel (off by default).
-  enable_split_decode_ = std::is_same_v<T, MLFloat16> && std::is_same_v<U, MLFloat16> &&
+  // ORT_GQA_SPLIT_DECODE=1 opts in to the single-token split decode kernel (off by default): fp16 queries
+  // with an fp16 cache, or an 8-bit (INT8 / FP8 E4M3) cache the kernel reads without dequantizing it.
+  constexpr bool kSplitDecodeCache = std::is_same_v<U, MLFloat16> || std::is_same_v<U, int8_t>
+#ifdef USE_FP8_KV_CACHE
+                                     || std::is_same_v<U, Float8E4M3FN>
+#endif
+      ;
+  enable_split_decode_ = std::is_same_v<T, MLFloat16> && kSplitDecodeCache &&
                          (ParseEnvironmentVariableWithDefault<int>("ORT_GQA_SPLIT_DECODE", 0) != 0);
 
   kernel_options_ = this->GetAttentionKernelOptions();
@@ -715,11 +721,18 @@ Status GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) cons
   xqa_inputs.v_quant_type = v_quant_type_;
 
   // Single-token decode shapes the split decode kernel handles (group_query_attention_split_decode.h).
-  // It runs on the Flash path, replacing PrepareQKV and the Flash split-KV kernels.
+  // It runs on the Flash path, replacing PrepareQKV and the Flash split-KV kernels (and, for an 8-bit
+  // cache, the dequantization of the whole cache that the Flash fallback needs). An 8-bit cache needs both
+  // K and V quantized (PER_TENSOR or PER_CHANNEL) at 8 bits; the fp16 cache must not be quantized.
+  const bool split_decode_cache_ok =
+      (is_int8 || is_fp8)
+          ? (is_inputs_quantized && k_quant_type_ != KVQuantizationType::NONE &&
+             v_quant_type_ != KVQuantizationType::NONE && (kv_cache_bit_width_ == 0 || kv_cache_bit_width_ == 8))
+          : !is_inputs_quantized;
   const bool split_decode_shape_ok =
       enable_split_decode_ && !parameters.is_first_prompt && parameters.sequence_length == 1 &&
       query_seqlens_data == nullptr &&
-      parameters.past_present_share_buffer && !is_inputs_quantized &&
+      parameters.past_present_share_buffer && split_decode_cache_ok &&
       parameters.past_kv_format == AttentionQkvFormat::Q_K_V_BNSH &&
       parameters.num_heads == kGqaSplitDecodeGroup * parameters.kv_num_heads &&
       parameters.head_size == kGqaSplitDecodeHeadSize && parameters.softcap == 0.0f &&
@@ -1046,8 +1059,18 @@ Status GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) cons
                                                                  : GQAPreprocessMode::Unfused));
   preparation_route.use_flash_attention_fast_decode = data.use_flash_attention_fast_decode;
   size_t qkv_preprocess_bytes = 0;
+  // Split decode only stages the rotated Q in this scratch, also for an 8-bit cache, which it reads as stored:
+  // size it as for an unquantized cache rather than for the dequantized copy of the cache the Flash
+  // fallback would need.
+  GQAWorkspaceProblem preprocess_problem = workspace_problem;
+  if (data.use_split_decode && is_inputs_quantized) {
+    preprocess_problem.cache_element_size = sizeof(T);
+    preprocess_problem.kv_cache_bit_width = 0;
+    preprocess_problem.k_quantization = GQAKvQuantizationType::None;
+    preprocess_problem.v_quantization = GQAKvQuantizationType::None;
+  }
   const auto qkv_status = GetGQAQkvPreprocessBytes(
-      workspace_problem, preparation_route, parameters.seqlen_present_kv_cache, qkv_preprocess_bytes);
+      preprocess_problem, preparation_route, parameters.seqlen_present_kv_cache, qkv_preprocess_bytes);
   ORT_RETURN_IF_NOT(qkv_status.IsOK(),
                     "GQA QKV preparation sizing failed: ", qkv_status.message);
 

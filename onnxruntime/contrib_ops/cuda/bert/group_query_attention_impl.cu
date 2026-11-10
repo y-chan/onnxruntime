@@ -1210,6 +1210,48 @@ Status FlashDecoding(
   return Status::OK();
 }
 
+// Single-token decode on the split decode kernel (group_query_attention_split_decode.h): one prep launch
+// (QK-Norm, RoPE, cache append, quantized for an 8-bit cache) and one attention launch over the cache as
+// stored; total_seq_lens and past_seq_lens come from GetSequenceLengths. fp16 queries with an fp16, INT8 or
+// FP8 E4M3 cache only (GroupQueryAttention gates use_split_decode on that).
+template <typename T, typename U>
+Status SplitDecodeAttention(cudaStream_t stream, GroupQueryAttentionParameters& parameters,
+                            GroupQueryAttentionData<T, U>& data, float scale) {
+  if constexpr (std::is_same<T, half>::value &&
+                (std::is_same<U, half>::value || std::is_same<U, int8_t>::value ||
+                 std::is_same<U, __nv_fp8_e4m3>::value)) {
+    GqaSplitDecodeQuant quant;
+    if constexpr (!std::is_same<U, half>::value) {
+      quant.cache = std::is_same<U, int8_t>::value ? GqaSplitDecodeCache::kInt8 : GqaSplitDecodeCache::kFp8E4M3;
+      quant.k_scale = data.k_scale;
+      quant.v_scale = data.v_scale;
+      quant.k_per_channel = parameters.k_quant_type == KVQuantizationType::PER_CHANNEL;
+      quant.v_per_channel = parameters.v_quant_type == KVQuantizationType::PER_CHANNEL;
+    }
+    half* q_out = reinterpret_cast<half*>(data.qkv_buffer);
+    const bool packed = parameters.is_packed_qkv;
+    ORT_RETURN_IF_ERROR(LaunchGqaSplitDecodePrep(
+        stream, packed ? data.query : nullptr, packed ? nullptr : data.query, packed ? nullptr : data.key,
+        packed ? nullptr : data.value, q_out, data.present_key, data.present_value, data.past_seq_lens,
+        data.position_ids, data.cos_cache, data.sin_cache, RopeMaxPosition(parameters),
+        parameters.do_rotary && data.cos_cache != nullptr && data.sin_cache != nullptr, data.q_norm_weight,
+        data.k_norm_weight, parameters.q_norm_epsilon, parameters.k_norm_epsilon, data.split_decode_counters,
+        parameters.batch_size, parameters.num_heads, parameters.kv_num_heads, parameters.seqlen_present_kv_cache,
+        quant));
+    return LaunchGqaSplitDecode(stream, q_out, data.present_key, data.present_value, data.output,
+                                data.total_seq_lens, scale, parameters.batch_size, parameters.kv_num_heads,
+                                parameters.seqlen_present_kv_cache, data.split_decode_max_splits,
+                                data.split_decode_partials, data.split_decode_counters, quant);
+  } else {
+    ORT_UNUSED_PARAMETER(stream);
+    ORT_UNUSED_PARAMETER(parameters);
+    ORT_UNUSED_PARAMETER(data);
+    ORT_UNUSED_PARAMETER(scale);
+    return ORT_MAKE_STATUS(ONNXRUNTIME, NOT_IMPLEMENTED,
+                           "GroupQueryAttention split decode supports fp16 queries with an fp16, INT8 or FP8 cache.");
+  }
+}
+
 // Use extra kernel(s) for unpacking, rotary and kv append.
 // Flash attention is used for attention only.
 template <typename T, typename U>
@@ -1236,25 +1278,8 @@ Status FlashAttention(
 
   DUMP_TENSOR_INIT();
 
-  if constexpr (std::is_same<T, half>::value && std::is_same<U, half>::value) {
-    if (data.use_split_decode) {
-      // One-token prep (QK-Norm, RoPE, append) and attention; total_seq_lens and past_seq_lens
-      // come from GetSequenceLengths.
-      half* q_out = reinterpret_cast<half*>(data.qkv_buffer);
-      const bool packed = parameters.is_packed_qkv;
-      ORT_RETURN_IF_ERROR(LaunchGqaSplitDecodePrep(
-          stream, packed ? data.query : nullptr, packed ? nullptr : data.query, packed ? nullptr : data.key,
-          packed ? nullptr : data.value, q_out, data.present_key, data.present_value, data.past_seq_lens,
-          data.position_ids, data.cos_cache, data.sin_cache, RopeMaxPosition(parameters),
-          parameters.do_rotary && data.cos_cache != nullptr && data.sin_cache != nullptr, data.q_norm_weight,
-          data.k_norm_weight, parameters.q_norm_epsilon, parameters.k_norm_epsilon, data.split_decode_counters,
-          batch_size, num_heads, kv_num_heads, parameters.seqlen_present_kv_cache));
-      return LaunchGqaSplitDecode(stream, q_out, data.present_key, data.present_value, data.output,
-                                  data.total_seq_lens, scale, batch_size, kv_num_heads,
-                                  parameters.seqlen_present_kv_cache, data.split_decode_max_splits,
-                                  data.split_decode_partials,
-                                  data.split_decode_counters);
-    }
+  if (data.use_split_decode) {
+    return SplitDecodeAttention(stream, parameters, data, scale);
   }
 
   const T* q_prep = nullptr;
@@ -1912,6 +1937,9 @@ Status QkvToContext(
     if (parameters.k_quant_type != KVQuantizationType::NONE || parameters.v_quant_type != KVQuantizationType::NONE) {
       if (parameters.is_first_prompt) {
         return FlashAttentionAndQuantizeKV(device_prop, stream, parameters, data, scale);
+      } else if (data.use_split_decode) {
+        // The split decode kernel reads the 8-bit cache itself; nothing is dequantized.
+        return SplitDecodeAttention(stream, parameters, data, scale);
       } else {
         return DequantizeFlashAttentionFallback(device_prop, stream, parameters, data, scale);
       }
