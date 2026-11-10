@@ -14,6 +14,7 @@
 #include "contrib_ops/cuda/utils/dump_cuda_tensor.h"
 #include "contrib_ops/cuda/bert/paged_attention_impl.h"
 #include "contrib_ops/cuda/bert/paged_attention.h"
+#include "contrib_ops/cuda/bert/group_query_attention_split_decode.h"
 #include "contrib_ops/cpu/bert/paged_attention_helper.h"
 #include "contrib_ops/cuda/bert/flash_attention/flash_api.h"
 #include "contrib_ops/cuda/bert/cutlass_fmha/memory_efficient_attention.h"
@@ -174,6 +175,8 @@ PagedAttention<T, TCACHE>::PagedAttention(const OpKernelInfo& info)
       skip_sanitizer_cfg == "1" ||
       (skip_sanitizer_cfg.empty() &&
        ParseEnvironmentVariableWithDefault<int>("ORT_PAGED_ATTENTION_SKIP_SANITIZER", 0) != 0);
+  enable_split_decode_ = std::is_same_v<T, MLFloat16> &&
+                         (ParseEnvironmentVariableWithDefault<int>("ORT_PAGED_ATTENTION_SPLIT_DECODE", 0) != 0);
 }
 
 template <typename T, typename TCACHE>
@@ -533,6 +536,90 @@ Status PagedAttention<T, TCACHE>::ComputeInternal(OpKernelContext* context) cons
                              max_kv_len_bound, ").");
     }
     max_kv_len_lower_bound = metadata_kv_lower_bound;
+  }
+
+  // Opt-in split decode (ORT_PAGED_ATTENTION_SPLIT_DECODE=1): a step that provably appends one token per
+  // sequence runs GroupQueryAttention's split decode kernel (group_query_attention_split_decode.h) on the
+  // paged cache in place -- fp16, or INT8 / FP8 E4M3 with PER_TENSOR or PER_CHANNEL scales -- in place of
+  // the backends below. The proof is the one XQA needs: token_count == batch_size and an
+  // attention_metadata query bound of 1. The sanitized block table and sequence lengths are used; a
+  // sequence the sanitizer invalidated gets a zero output and no append.
+  if constexpr (std::is_same_v<T, MLFloat16> &&
+                (std::is_same_v<TCACHE, MLFloat16> || std::is_same_v<TCACHE, int8_t> || IsFp8CacheType<TCACHE>())) {
+    const bool split_decode_cache_ok =
+        !kIsQuantizedCache || (parameters.k_quant_type != KVQuantizationType::NONE &&
+                               parameters.v_quant_type != KVQuantizationType::NONE);
+    const bool use_split_decode =
+        enable_split_decode_ && device_prop.major >= 8 && split_decode_cache_ok && !parameters.is_latent_kv &&
+        has_metadata_bounds && max_query_len_bound == 1 && parameters.token_count == parameters.batch_size &&
+        parameters.num_heads == kGqaSplitDecodeGroup * parameters.kv_num_heads &&
+        parameters.head_size == kGqaSplitDecodeHeadSize && parameters.v_head_size == parameters.head_size &&
+        parameters.softcap == 0.0f && !parameters.use_smooth_softmax && head_sink == nullptr &&
+        parameters.local_window_size <= 0 && parameters.block_size % 8 == 0 &&
+        (!do_rotary_ || (!rotary_interleaved_ && parameters.rotary_dim == parameters.head_size &&
+                         parameters.rotary_offset == 0));
+    if (use_split_decode) {
+      const int batch = parameters.batch_size;
+      const int max_splits = GqaSplitDecodeMaxSplits(batch, parameters.kv_num_heads, max_kv_len_bound,
+                                                     device_prop.multiProcessorCount);
+      auto q_rot = GetScratchBuffer<void>(sizeof(T) * parameters.token_count * parameters.hidden_size,
+                                          GetComputeStream(context));
+      auto partials = GetScratchBuffer<void>(GqaSplitDecodePartialsBytes(batch, parameters.kv_num_heads, max_splits),
+                                             GetComputeStream(context));
+      auto counters = GetScratchBuffer<void>(GqaSplitDecodeCountersBytes(batch, parameters.kv_num_heads),
+                                             GetComputeStream(context));
+      auto totals = GetScratchBuffer<int>(batch, GetComputeStream(context));
+
+      GqaSplitDecodeQuant quant;
+      if constexpr (kIsQuantizedCache) {
+        quant.cache = std::is_same_v<TCACHE, int8_t> ? GqaSplitDecodeCache::kInt8 : GqaSplitDecodeCache::kFp8E4M3;
+        quant.k_scale = k_scale->Data<float>();
+        quant.v_scale = v_scale->Data<float>();
+        quant.k_per_channel = parameters.k_quant_type == KVQuantizationType::PER_CHANNEL;
+        quant.v_per_channel = parameters.v_quant_type == KVQuantizationType::PER_CHANNEL;
+      }
+      GqaSplitDecodePaged paged;
+      paged.block_table = active_block_table;
+      paged.slot_mapping = slot_mapping != nullptr ? slot_mapping->Data<int>() : nullptr;
+      paged.cumulative_seqlens_q = active_cumulative_seqlens_q;
+      paged.sequence_validity = active_sequence_validity;
+      paged.total_seq_lens = totals.get();
+      paged.block_size = parameters.block_size;
+      paged.max_blocks_per_seq = parameters.max_num_blocks_per_seq;
+
+      const half* q_in = reinterpret_cast<const half*>(query->Data<T>());
+      const bool packed = parameters.is_packed_qkv;
+      const half* k_in = packed ? nullptr : reinterpret_cast<const half*>(key->Data<T>());
+      const half* v_in = packed ? nullptr : reinterpret_cast<const half*>(value->Data<T>());
+      const half* cos = do_rotary_ ? reinterpret_cast<const half*>(cos_cache->Data<T>()) : nullptr;
+      const half* sin = do_rotary_ ? reinterpret_cast<const half*>(sin_cache->Data<T>()) : nullptr;
+      const int rope_max_pos = do_rotary_ ? static_cast<int>(cos_cache->Shape()[0]) : 0;
+      const half* q_norm = parameters.use_qk_norm ? reinterpret_cast<const half*>(q_norm_weight->Data<T>()) : nullptr;
+      const half* k_norm = parameters.use_qk_norm ? reinterpret_cast<const half*>(k_norm_weight->Data<T>()) : nullptr;
+      half* q_out = reinterpret_cast<half*>(q_rot.get());
+      void* k_cache_ptr = key_cache_out->MutableDataRaw();
+      void* v_cache_ptr = value_cache_out->MutableDataRaw();
+
+      ORT_RETURN_IF_ERROR(LaunchGqaSplitDecodePrep(
+          cuda_stream, packed ? q_in : nullptr, packed ? nullptr : q_in, k_in, v_in, q_out, k_cache_ptr, v_cache_ptr,
+          active_past_seqlens, /*position_ids*/ nullptr, cos, sin, rope_max_pos, do_rotary_, q_norm, k_norm,
+          qk_norm_epsilon_, qk_norm_epsilon_, reinterpret_cast<unsigned int*>(counters.get()), batch,
+          parameters.num_heads, parameters.kv_num_heads, max_kv_len_capacity, quant, &paged));
+      ORT_RETURN_IF_ERROR(LaunchGqaSplitDecode(
+          cuda_stream, q_out, k_cache_ptr, v_cache_ptr, reinterpret_cast<half*>(output->MutableData<T>()), totals.get(),
+          cudnn_scale, batch, parameters.kv_num_heads, max_kv_len_capacity, max_splits,
+          reinterpret_cast<float*>(partials.get()), reinterpret_cast<unsigned int*>(counters.get()), quant, &paged));
+
+      if (kernel_options_->AllowDebugInfo()) {
+        AttentionKernelDebugInfo debug_info;
+        debug_info.use_split_decode = true;
+        debug_info.num_splits = max_splits;
+        debug_info.gqa_group_size = parameters.num_heads / parameters.kv_num_heads;
+        debug_info.effective_kv_length_bound = max_kv_len_bound;
+        debug_info.Print("PagedAttention", this->Node().Name(), true, false);
+      }
+      return Status::OK();
+    }
   }
 
   // Backend selection from static shapes alone.

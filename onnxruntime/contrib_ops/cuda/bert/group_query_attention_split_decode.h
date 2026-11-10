@@ -66,6 +66,25 @@ struct GqaSplitDecodeQuant {
   bool v_per_channel = false;
 };
 
+// A paged cache (PagedAttention): key/value caches [num_blocks, block_size, kv_num_heads, head_size], and
+// sequence b's position t at block block_table[b][t / block_size], slot t % block_size. block_size must be a
+// multiple of 8 (one 8-key step never crosses a block). With `paged` null the cache is the BNSH
+// [batch, kv_num_heads, capacity, head_size] buffer of GroupQueryAttention.
+//
+// For a paged cache the prep kernel also derives the per-sequence lengths the attention kernel reads:
+// sequence b is valid when it has exactly one query token (cumulative_seqlens_q[b + 1] - [b] == 1, token b)
+// and, with `sequence_validity`, is marked valid; it then appends at past_seqlens[b] (or slot_mapping[b])
+// and total_seq_lens[b] = past + 1. An invalid sequence gets total 0: no append and a zero output.
+struct GqaSplitDecodePaged {
+  const int* block_table = nullptr;           // [batch, max_blocks_per_seq]
+  const int* slot_mapping = nullptr;          // [batch] flat slot (block * block_size + offset), nullable
+  const int* cumulative_seqlens_q = nullptr;  // [batch + 1]
+  const int* sequence_validity = nullptr;     // [batch] nonzero = valid, nullable (all valid)
+  int* total_seq_lens = nullptr;              // [batch] written by the prep kernel
+  int block_size = 0;
+  int max_blocks_per_seq = 0;
+};
+
 // Decode-step preparation for the split decode path, replacing UnpackRoPEAppend for one token:
 // per (head, batch) one warp loads the head, applies QK-Norm (fp32 statistics, result rounded to
 // fp16, as UnpackRoPEAppend does), half-split RoPE over the full head, then writes Q to q_out and
@@ -74,21 +93,25 @@ struct GqaSplitDecodeQuant {
 // position_ids [batch] (nullable: past_seq_lens[b] is the position); cos/sin [rope_max_pos, head_size / 2]
 // (nullable when do_rotary is false); q_norm/k_norm [head_size] (nullable). It also zeroes `counters`
 // [batch, kv_num_heads] for the LaunchGqaSplitDecode call that follows on the same stream.
-// k_cache / v_cache hold half, int8_t or __nv_fp8_e4m3 elements as quant.cache says.
+// k_cache / v_cache hold half, int8_t or __nv_fp8_e4m3 elements as quant.cache says. For a paged cache
+// `capacity` is max_blocks_per_seq * block_size and position_ids must be null.
 Status LaunchGqaSplitDecodePrep(cudaStream_t stream, const half* packed_qkv, const half* q, const half* k,
                                 const half* v, half* q_out, void* k_cache, void* v_cache, const int* past_seq_lens,
                                 const int64_t* position_ids, const half* cos_cache, const half* sin_cache,
                                 int rope_max_pos, bool do_rotary, const half* q_norm, const half* k_norm, float q_eps,
                                 float k_eps, unsigned int* counters, int batch_size, int num_heads, int kv_num_heads,
-                                int capacity, const GqaSplitDecodeQuant& quant);
+                                int capacity, const GqaSplitDecodeQuant& quant,
+                                const GqaSplitDecodePaged* paged = nullptr);
 
 // q:       [batch, 1, num_heads, head_size] (BSNH, rotated/normalized)
-// k_cache: [batch, kv_num_heads, capacity, head_size] (BNSH), v_cache likewise, elements as quant.cache says
+// k_cache: [batch, kv_num_heads, capacity, head_size] (BNSH), v_cache likewise, elements as quant.cache says;
+//          or the paged layout above
 // output:  [batch, 1, num_heads * head_size]
+// total_seq_lens: [batch] keys per sequence (for a paged cache, paged->total_seq_lens as written by the prep)
 Status LaunchGqaSplitDecode(cudaStream_t stream, const half* q, const void* k_cache, const void* v_cache,
                             half* output, const int* total_seq_lens, float scale, int batch_size, int kv_num_heads,
                             int capacity, int max_splits, float* partials, unsigned int* counters,
-                            const GqaSplitDecodeQuant& quant);
+                            const GqaSplitDecodeQuant& quant, const GqaSplitDecodePaged* paged = nullptr);
 
 }  // namespace cuda
 }  // namespace contrib

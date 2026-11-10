@@ -54,7 +54,7 @@ __device__ __forceinline__ uint32_t Quantize8(float x, float sc) {
 
 // grid (num_heads + 2 * kv_num_heads, batch), block 32. Lane l owns channels 4l..4l+3; with the
 // half-split rotation the partner of channel c is c +- head_size / 2, i.e. lane l ^ 16.
-template <int kCache>
+template <int kCache, bool kPaged>
 __global__ void __launch_bounds__(32) GqaSplitDecodePrepKernel(
     const half* __restrict__ packed_qkv, const half* __restrict__ q_in, const half* __restrict__ k_in,
     const half* __restrict__ v_in, half* __restrict__ q_out, void* __restrict__ k_cache, void* __restrict__ v_cache,
@@ -62,9 +62,17 @@ __global__ void __launch_bounds__(32) GqaSplitDecodePrepKernel(
     const half* __restrict__ cos_cache, const half* __restrict__ sin_cache, int rope_max_pos, int do_rotary,
     const half* __restrict__ q_norm, const half* __restrict__ k_norm, float q_eps, float k_eps,
     unsigned int* __restrict__ counters, int num_heads, int kv_num_heads, int capacity,
-    const float* __restrict__ k_scale, const float* __restrict__ v_scale, int k_per_channel, int v_per_channel) {
+    const float* __restrict__ k_scale, const float* __restrict__ v_scale, int k_per_channel, int v_per_channel,
+    GqaSplitDecodePaged paged) {
   static_assert(kHead == 128, "lane l owns channels 4l..4l+3");
   const int head = blockIdx.x, b = blockIdx.y, lane = threadIdx.x;
+  // Paged: sequence b must own exactly query token b (see GqaSplitDecodePaged); otherwise it has no keys,
+  // appends nothing and gets a zero output from the attention kernel.
+  bool valid = true;
+  if constexpr (kPaged) {
+    valid = paged.cumulative_seqlens_q[b] == b && paged.cumulative_seqlens_q[b + 1] == b + 1 &&
+            (paged.sequence_validity == nullptr || paged.sequence_validity[b] != 0);
+  }
   const int packed_width = (num_heads + 2 * kv_num_heads) * kHead;
   int type, n;
   const half* src;
@@ -122,12 +130,30 @@ __global__ void __launch_bounds__(32) GqaSplitDecodePrepKernel(
       }
     }
   }
+  // Cache row of the new token: BNSH (b, n, past), or the paged slot of (b, past) for head n.
+  int64_t row = -1;
+  if (valid && past >= 0 && past < capacity) {
+    if constexpr (kPaged) {
+      int64_t slot = -1;
+      if (paged.slot_mapping != nullptr) {
+        slot = paged.slot_mapping[b];
+      } else {
+        const int block = paged.block_table[static_cast<int64_t>(b) * paged.max_blocks_per_seq + past / paged.block_size];
+        if (block >= 0) slot = static_cast<int64_t>(block) * paged.block_size + past % paged.block_size;
+      }
+      if (slot >= 0) row = slot * kv_num_heads + n;
+    } else {
+      row = (static_cast<int64_t>(b) * kv_num_heads + n) * capacity + past;
+    }
+  }
+  if constexpr (kPaged) {
+    if (head == 0 && lane == 0) paged.total_seq_lens[b] = valid && past >= 0 && past < capacity ? past + 1 : 0;
+  }
   if (type == 0) {
     uint2 out;
     memcpy(&out, x, sizeof(out));
     reinterpret_cast<uint2*>(q_out + (static_cast<int64_t>(b) * num_heads + n) * kHead)[lane] = out;
-  } else if (past >= 0 && past < capacity) {
-    const int64_t row = (static_cast<int64_t>(b) * kv_num_heads + n) * capacity + past;
+  } else if (row >= 0) {
     void* cache = type == 1 ? k_cache : v_cache;
     if constexpr (kCache == kCacheFp16) {
       uint2 out;
@@ -275,7 +301,10 @@ __device__ __forceinline__ int VSwizzle(int row) {
 // fragments straight from global memory touches only part of each 128-byte line of K per request, which
 // caps the streaming rate of an SM well below its share of DRAM bandwidth. An 8-bit cache is copied as is and
 // widened to fp16 as the fragments are read (Widen8).
-template <int kStages, int kCache>
+//
+// A paged cache (kPaged) is addressed per 8-key step: the step's keys share one block (block_size % 8 == 0), so
+// the block table is read once per step and the rows are kv_num_heads rows apart.
+template <int kStages, int kCache, bool kPaged>
 __global__ void __launch_bounds__(kThreads, 1) GqaSplitDecodeKernel(const half* __restrict__ q,
                                                                     const void* __restrict__ k_cache,
                                                                     const void* __restrict__ v_cache,
@@ -286,7 +315,9 @@ __global__ void __launch_bounds__(kThreads, 1) GqaSplitDecodeKernel(const half* 
                                                                     unsigned int* __restrict__ counters,
                                                                     const float* __restrict__ k_scale,
                                                                     const float* __restrict__ v_scale,
-                                                                    int k_per_channel, int v_per_channel) {
+                                                                    int k_per_channel, int v_per_channel,
+                                                                    const int* __restrict__ block_table,
+                                                                    int block_size, int max_blocks_per_seq) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
   constexpr int kRow = RowBytes<kCache>();
   constexpr int kChunks = kRow / 16;  // 16-byte chunks per row
@@ -306,6 +337,14 @@ __global__ void __launch_bounds__(kThreads, 1) GqaSplitDecodeKernel(const half* 
   const int warp = tid / 32, lane = tid % 32, g = lane / 4, r = lane % 4;
   const int kv_heads = gridDim.x, max_splits = gridDim.y;
   const int total = total_seq_lens[b];
+  if (total <= 0) {
+    // A paged sequence without its query token (see GqaSplitDecodePaged): zero output, nothing to merge.
+    if (split == 0) {
+      half* ob = out + (static_cast<int64_t>(b) * kv_heads + kvh) * kGroup * kHead;
+      for (int i = tid; i < kGroup * kHead; i += kThreads) ob[i] = __float2half(0.f);
+    }
+    return;
+  }
   const int splits = SplitCount(total, max_splits, kGqaSplitDecodeMinKeysPerSplit);
   if (split >= splits) return;
   const int steps = (total + kStep - 1) / kStep;
@@ -341,9 +380,10 @@ __global__ void __launch_bounds__(kThreads, 1) GqaSplitDecodeKernel(const half* 
   uint4 qf[4];
 #pragma unroll
   for (int blk = 0; blk < 4; ++blk) qf[blk] = __ldg(reinterpret_cast<const uint4*>(qrow + 32 * blk + 8 * r));
-  const int64_t cache_off = static_cast<int64_t>(bh) * capacity * kRow;  // bytes
+  const int64_t cache_off = kPaged ? 0 : static_cast<int64_t>(bh) * capacity * kRow;  // bytes
   const char* kb = static_cast<const char*>(k_cache) + cache_off;
   const char* vb = static_cast<const char*>(v_cache) + cache_off;
+  const int* table = kPaged ? block_table + static_cast<int64_t>(b) * max_blocks_per_seq : nullptr;
   uint4* ring = s_ring + warp * kStages * 2 * kStep * kChunks;
 
   // Copies the 8 key rows of K and of V from `base` into ring stage `stage`, chunks XOR-swizzled within
@@ -352,11 +392,21 @@ __global__ void __launch_bounds__(kThreads, 1) GqaSplitDecodeKernel(const half* 
   auto issue = [&](int base, int stage) {
     uint4* dk = ring + stage * 2 * kStep * kChunks;
     uint4* dv = dk + kStep * kChunks;
+    // Cache row of key `base`, and the distance in rows between consecutive keys of the step.
+    int64_t row0 = base;
+    constexpr int64_t kNextKey = 1;
+    int64_t next_key = kNextKey;
+    if constexpr (kPaged) {
+      const int block = __ldg(table + base / block_size);
+      row0 = (static_cast<int64_t>(block) * block_size + base % block_size) * kv_heads + kvh;
+      next_key = kv_heads;
+    }
 #pragma unroll
     for (int j = 0; j < kStep * kChunks / 32; ++j) {
       const int c = lane + 32 * j, row = c / kChunks, col = c % kChunks;
       const bool ok = base + row < t1;
-      const int64_t src = static_cast<int64_t>(ok ? base + row : t0) * kRow + 16 * col;
+      // An invalid row is zero-filled, but still needs a readable address: key `base` (in range).
+      const int64_t src = (row0 + (ok ? row : 0) * next_key) * kRow + 16 * col;
       CpAsync16(dk + row * kChunks + (col ^ KSwizzle<kCache>(row)), kb + src, ok);
       CpAsync16(dv + row * kChunks + (col ^ VSwizzle<kCache>(row)), vb + src, ok);
     }
@@ -587,28 +637,44 @@ constexpr size_t RingBytes(int stages) {
   return sizeof(uint4) * kWarps * stages * 2 * kStep * (RowBytes<kCache>() / 16);
 }
 
-template <int kStages, int kCache>
-Status Launch(cudaStream_t stream, dim3 grid, const half* q, const void* k_cache, const void* v_cache, half* output,
-              const int* total_seq_lens, float scale, int capacity, float* partials, unsigned int* counters,
-              const GqaSplitDecodeQuant& quant) {
+// Arguments of one attention launch.
+struct LaunchArgs {
+  dim3 grid;
+  const half* q;
+  const void* k_cache;
+  const void* v_cache;
+  half* output;
+  const int* total_seq_lens;
+  float scale;
+  int capacity;
+  float* partials;
+  unsigned int* counters;
+  const GqaSplitDecodeQuant* quant;
+  const GqaSplitDecodePaged* paged;  // null for the BNSH cache
+};
+
+template <int kStages, int kCache, bool kPaged>
+Status Launch(cudaStream_t stream, const LaunchArgs& a) {
   constexpr int kBytes = static_cast<int>(RingBytes<kCache>(kStages));
   static_assert(sizeof(float) * kWarps * kGroup * kHead <= kBytes, "s_red must fit in the ring");
-  ORT_RETURN_IF_ERROR(CUDA_CALL(cudaFuncSetAttribute(GqaSplitDecodeKernel<kStages, kCache>,
-                                                     cudaFuncAttributeMaxDynamicSharedMemorySize, kBytes)));
-  GqaSplitDecodeKernel<kStages, kCache><<<grid, kThreads, kBytes, stream>>>(
-      q, k_cache, v_cache, output, total_seq_lens, scale, capacity, partials, counters, quant.k_scale, quant.v_scale,
-      quant.k_per_channel ? 1 : 0, quant.v_per_channel ? 1 : 0);
+  auto* kernel = GqaSplitDecodeKernel<kStages, kCache, kPaged>;
+  ORT_RETURN_IF_ERROR(CUDA_CALL(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kBytes)));
+  kernel<<<a.grid, kThreads, kBytes, stream>>>(
+      a.q, a.k_cache, a.v_cache, a.output, a.total_seq_lens, a.scale, a.capacity, a.partials, a.counters,
+      a.quant->k_scale, a.quant->v_scale, a.quant->k_per_channel ? 1 : 0, a.quant->v_per_channel ? 1 : 0,
+      kPaged ? a.paged->block_table : nullptr, kPaged ? a.paged->block_size : 0,
+      kPaged ? a.paged->max_blocks_per_seq : 0);
   return CUDA_CALL(cudaGetLastError());
 }
 
 // Whether a ring of `stages` steps plus the kernel's static shared memory fits the per-block opt-in limit.
-template <int kStages, int kCache>
+template <int kStages, int kCache, bool kPaged>
 bool RingFits() {
   int device = 0, optin = 0;
   cudaFuncAttributes attr{};
   if (cudaGetDevice(&device) != cudaSuccess ||
       cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device) != cudaSuccess ||
-      cudaFuncGetAttributes(&attr, GqaSplitDecodeKernel<kStages, kCache>) != cudaSuccess) {
+      cudaFuncGetAttributes(&attr, GqaSplitDecodeKernel<kStages, kCache, kPaged>) != cudaSuccess) {
     return false;
   }
   return attr.sharedSizeBytes + RingBytes<kCache>(kStages) <= static_cast<size_t>(optin);
@@ -617,28 +683,27 @@ bool RingFits() {
 // Ring depth: the deepest ring that fits. fp16: 4 steps (128 KB) on sm_80 / sm_87 / sm_90, else 3 (96 KB,
 // within the 99 KB of sm_86, sm_89 and sm_120). 8-bit rows are half as long, so the same bytes in flight
 // take twice the steps: 8 (128 KB), else 6 (96 KB), else 4.
-template <int kCache>
-Status LaunchCache(cudaStream_t stream, dim3 grid, const half* q, const void* k_cache, const void* v_cache,
-                   half* output, const int* total_seq_lens, float scale, int capacity, float* partials,
-                   unsigned int* counters, const GqaSplitDecodeQuant& quant) {
+template <int kCache, bool kPaged>
+Status LaunchCache(cudaStream_t stream, const LaunchArgs& a) {
   if constexpr (kCache == kCacheFp16) {
-    if (RingFits<4, kCache>()) {
-      return Launch<4, kCache>(stream, grid, q, k_cache, v_cache, output, total_seq_lens, scale, capacity, partials,
-                               counters, quant);
-    }
-    return Launch<3, kCache>(stream, grid, q, k_cache, v_cache, output, total_seq_lens, scale, capacity, partials,
-                             counters, quant);
+    if (RingFits<4, kCache, kPaged>()) return Launch<4, kCache, kPaged>(stream, a);
+    return Launch<3, kCache, kPaged>(stream, a);
   } else {
-    if (RingFits<8, kCache>()) {
-      return Launch<8, kCache>(stream, grid, q, k_cache, v_cache, output, total_seq_lens, scale, capacity, partials,
-                               counters, quant);
-    }
-    if (RingFits<6, kCache>()) {
-      return Launch<6, kCache>(stream, grid, q, k_cache, v_cache, output, total_seq_lens, scale, capacity, partials,
-                               counters, quant);
-    }
-    return Launch<4, kCache>(stream, grid, q, k_cache, v_cache, output, total_seq_lens, scale, capacity, partials,
-                             counters, quant);
+    if (RingFits<8, kCache, kPaged>()) return Launch<8, kCache, kPaged>(stream, a);
+    if (RingFits<6, kCache, kPaged>()) return Launch<6, kCache, kPaged>(stream, a);
+    return Launch<4, kCache, kPaged>(stream, a);
+  }
+}
+
+template <bool kPaged>
+Status LaunchLayout(cudaStream_t stream, const LaunchArgs& a) {
+  switch (a.quant->cache) {
+    case GqaSplitDecodeCache::kInt8:
+      return LaunchCache<kCacheInt8, kPaged>(stream, a);
+    case GqaSplitDecodeCache::kFp8E4M3:
+      return LaunchCache<kCacheFp8, kPaged>(stream, a);
+    default:
+      return LaunchCache<kCacheFp16, kPaged>(stream, a);
   }
 }
 
@@ -674,25 +739,37 @@ Status LaunchGqaSplitDecodePrep(cudaStream_t stream, const half* packed_qkv, con
                                 const int64_t* position_ids, const half* cos_cache, const half* sin_cache,
                                 int rope_max_pos, bool do_rotary, const half* q_norm, const half* k_norm, float q_eps,
                                 float k_eps, unsigned int* counters, int batch_size, int num_heads, int kv_num_heads,
-                                int capacity, const GqaSplitDecodeQuant& quant) {
+                                int capacity, const GqaSplitDecodeQuant& quant, const GqaSplitDecodePaged* paged) {
+  if (paged != nullptr && (paged->block_size <= 0 || paged->block_size % kStep != 0 || position_ids != nullptr)) {
+    return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT,
+                           "GQA split decode: a paged cache needs block_size % 8 == 0 and no position_ids.");
+  }
   const dim3 grid(num_heads + 2 * kv_num_heads, batch_size);
   const int kpc = quant.k_per_channel ? 1 : 0, vpc = quant.v_per_channel ? 1 : 0;
-#define ORT_GQA_SPLIT_DECODE_PREP(kCache)                                                                         \
-  GqaSplitDecodePrepKernel<kCache><<<grid, 32, 0, stream>>>(                                                      \
+  const GqaSplitDecodePaged paged_args = paged != nullptr ? *paged : GqaSplitDecodePaged{};
+#define ORT_GQA_SPLIT_DECODE_PREP(kCache, kPaged)                                                                  \
+  GqaSplitDecodePrepKernel<kCache, kPaged><<<grid, 32, 0, stream>>>(                                                \
       packed_qkv, q, k, v, q_out, k_cache, v_cache, past_seq_lens, position_ids, cos_cache, sin_cache, rope_max_pos, \
       do_rotary ? 1 : 0, q_norm, k_norm, q_eps, k_eps, counters, num_heads, kv_num_heads, capacity, quant.k_scale,  \
-      quant.v_scale, kpc, vpc)
+      quant.v_scale, kpc, vpc, paged_args)
+#define ORT_GQA_SPLIT_DECODE_PREP_LAYOUT(kCache) \
+  if (paged != nullptr) {                        \
+    ORT_GQA_SPLIT_DECODE_PREP(kCache, true);     \
+  } else {                                       \
+    ORT_GQA_SPLIT_DECODE_PREP(kCache, false);    \
+  }
   switch (quant.cache) {
     case GqaSplitDecodeCache::kInt8:
-      ORT_GQA_SPLIT_DECODE_PREP(kCacheInt8);
+      ORT_GQA_SPLIT_DECODE_PREP_LAYOUT(kCacheInt8);
       break;
     case GqaSplitDecodeCache::kFp8E4M3:
-      ORT_GQA_SPLIT_DECODE_PREP(kCacheFp8);
+      ORT_GQA_SPLIT_DECODE_PREP_LAYOUT(kCacheFp8);
       break;
     default:
-      ORT_GQA_SPLIT_DECODE_PREP(kCacheFp16);
+      ORT_GQA_SPLIT_DECODE_PREP_LAYOUT(kCacheFp16);
       break;
   }
+#undef ORT_GQA_SPLIT_DECODE_PREP_LAYOUT
 #undef ORT_GQA_SPLIT_DECODE_PREP
   return CUDA_CALL(cudaGetLastError());
 }
@@ -700,19 +777,10 @@ Status LaunchGqaSplitDecodePrep(cudaStream_t stream, const half* packed_qkv, con
 Status LaunchGqaSplitDecode(cudaStream_t stream, const half* q, const void* k_cache, const void* v_cache,
                             half* output, const int* total_seq_lens, float scale, int batch_size, int kv_num_heads,
                             int capacity, int max_splits, float* partials, unsigned int* counters,
-                            const GqaSplitDecodeQuant& quant) {
-  const dim3 grid(kv_num_heads, max_splits, batch_size);
-  switch (quant.cache) {
-    case GqaSplitDecodeCache::kInt8:
-      return LaunchCache<kCacheInt8>(stream, grid, q, k_cache, v_cache, output, total_seq_lens, scale, capacity,
-                                     partials, counters, quant);
-    case GqaSplitDecodeCache::kFp8E4M3:
-      return LaunchCache<kCacheFp8>(stream, grid, q, k_cache, v_cache, output, total_seq_lens, scale, capacity,
-                                    partials, counters, quant);
-    default:
-      return LaunchCache<kCacheFp16>(stream, grid, q, k_cache, v_cache, output, total_seq_lens, scale, capacity,
-                                     partials, counters, quant);
-  }
+                            const GqaSplitDecodeQuant& quant, const GqaSplitDecodePaged* paged) {
+  const LaunchArgs args{dim3(kv_num_heads, max_splits, batch_size), q, k_cache, v_cache, output, total_seq_lens,
+                        scale, capacity, partials, counters, &quant, paged};
+  return paged != nullptr ? LaunchLayout<true>(stream, args) : LaunchLayout<false>(stream, args);
 }
 
 }  // namespace cuda

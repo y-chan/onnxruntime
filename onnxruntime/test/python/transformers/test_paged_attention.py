@@ -3209,6 +3209,86 @@ class TestPagedAttentionXqaDecode(unittest.TestCase):
         parity_check_paged_attention(config, rtol=5e-3, atol=5e-3)
 
 
+def paged_split_decode_test_cases():
+    """Decode steps (one token per sequence, attention_metadata [1, max_kv]) the split decode kernel takes:
+    8 query heads per KV head, head 128. Block sizes 16 and 256 (a context ending inside a block, steps that
+    cross blocks), RoPE / packed QKV / QK-Norm / slot_mapping, and fp16, INT8 and FP8 caches with PER_TENSOR
+    and PER_CHANNEL scales; past lengths ending on and inside an 8-key step and a 128-key split, long contexts."""
+    shapes = [
+        # (batch, total, num_heads, kv_num_heads, block, rotary, packed, qk_norm, slot_mapping, past)
+        (4, 1024, 32, 4, 16, True, False, True, False, [0, 7, 127, 1000]),
+        (3, 4096, 32, 4, 256, True, True, False, False, [4095 - 1, 255, 2048]),
+        (2, 512, 16, 2, 16, False, True, True, True, [300, 8]),
+        (8, 2048, 32, 4, 32, True, False, True, True, None),
+        (1, 8192, 64, 8, 256, True, False, False, False, [8000]),
+    ]
+    caches = [("float16", "NONE"), ("int8", "PER_TENSOR"), ("int8", "PER_CHANNEL")]
+    if has_fp8_kv_cache():
+        caches += [("fp8", "PER_TENSOR"), ("fp8", "PER_CHANNEL")]
+    for b, total, nh, kvh, blk, rotary, packed, qk_norm, slot, past in shapes:
+        for kv_type, quant in caches:
+            name = f"b{b}_t{total}_nh{nh}_{kvh}_blk{blk}_rot{rotary}_pkd{packed}_qkn{qk_norm}_slot{slot}_{kv_type}_{quant}"
+            yield name, b, total, nh, kvh, blk, rotary, packed, qk_norm, slot, past, kv_type, quant
+
+
+@unittest.skipIf(not has_flash_attention(), reason="Flash Attention is not available, skipping tests.")
+class TestPagedAttentionSplitDecode(unittest.TestCase):
+    """ORT_PAGED_ATTENTION_SPLIT_DECODE=1 (opt-in) runs one-token-per-sequence decode steps on the
+    GroupQueryAttention split decode kernel, which reads the paged fp16 / INT8 / FP8 cache in place. It is
+    selected only when token_count == batch_size and attention_metadata bounds the query length to 1."""
+
+    def setUp(self):
+        torch.manual_seed(0)
+
+    @staticmethod
+    def _config(batch, total, nh, kvh, blk, rotary, packed, qk_norm, slot, kv_type, quant, metadata=True):
+        config = Config(batch, 1, total, nh, kvh, 128, blk, False, rotary, False, packed, 0.0)
+        config.use_qk_norm = qk_norm
+        config.use_slot_mapping = slot
+        config.kv_cache_type = kv_type
+        config.k_quant_type = quant
+        config.v_quant_type = quant
+        config.use_attention_metadata = metadata
+        return config
+
+    @staticmethod
+    def _run(config, split_decode, **kwargs):
+        def run():
+            parity_check_paged_attention(config, rtol=5e-3, atol=5e-3, **kwargs)
+
+        with patch.dict(
+            os.environ,
+            {
+                "ORT_ENABLE_ATTENTION_KERNEL_DEBUG_INFO": "1",
+                "ORT_PAGED_ATTENTION_SPLIT_DECODE": "1" if split_decode else "0",
+            },
+        ):
+            return capture_native_stdout(run)
+
+    @parameterized.expand(paged_split_decode_test_cases())
+    def test_split_decode(self, _, b, total, nh, kvh, blk, rotary, packed, qk_norm, slot, past, kv_type, quant):
+        config = self._config(b, total, nh, kvh, blk, rotary, packed, qk_norm, slot, kv_type, quant)
+        kwargs = {}
+        if past is not None:
+            kwargs["past_seqlens_override"] = torch.tensor(past, dtype=torch.int32)
+        self.assertIn(" SplitDecode=1", self._run(config, True, **kwargs))
+
+    def test_not_selected_without_metadata(self):
+        # Without attention_metadata nothing proves one token per sequence, so another backend runs.
+        config = self._config(4, 1024, 32, 4, 16, True, False, True, False, "int8", "PER_TENSOR", metadata=False)
+        self.assertNotIn("SplitDecode=1", self._run(config, True))
+
+    def test_not_selected_for_ragged_step(self):
+        # A sequence without a token (token_count < batch_size) is not a decode step for this kernel.
+        config = self._config(4, 1024, 32, 4, 16, True, False, True, False, "int8", "PER_TENSOR")
+        output = self._run(config, True, new_seqlens_override=torch.tensor([1, 0, 1, 1], dtype=torch.int32))
+        self.assertNotIn("SplitDecode=1", output)
+
+    def test_off_by_default(self):
+        config = self._config(4, 1024, 32, 4, 16, True, False, True, False, "int8", "PER_TENSOR")
+        self.assertNotIn("SplitDecode=1", self._run(config, False))
+
+
 @unittest.skipIf(not has_xqa(), reason="XQA requires an SM80 or newer GPU")
 class TestPagedAttentionXqaSpeculative(unittest.TestCase):
     """Coverage for the multi-token (speculative decoding) paged XQA specialization.

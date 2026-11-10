@@ -65,6 +65,9 @@ class PagedAttention final : public CudaKernel {
   bool enable_cudnn_paged_;
   bool auto_enable_cudnn_paged_;
   bool skip_input_sanitizer_;
+  // ORT_PAGED_ATTENTION_SPLIT_DECODE=1 (opt-in): one-token-per-sequence decode steps run the
+  // GroupQueryAttention split decode kernel on the paged cache (group_query_attention_split_decode.h).
+  bool enable_split_decode_;
   // -1 = not yet resolved, 0 = the kernel needs more shared memory than this device allows,
   // 1 = it fits. Resolved once per node because it only depends on head_size / group size.
   mutable std::atomic<int> xqa_shared_memory_ok_{-1};
